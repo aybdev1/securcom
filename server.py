@@ -175,6 +175,31 @@ button.del:hover{background:rgba(255,77,77,.28)}
 .tag.reg{background:rgba(52,183,241,.16);color:var(--accent2)}.tag.log{background:rgba(37,211,102,.16);color:var(--accent)}
 .ago{margin-left:auto;color:var(--muted);font-size:12px}
 footer{color:var(--muted);font-size:11px;text-align:center;margin-top:22px}
+.recent-scroll {
+    max-height: 350px;      /* Adjust as needed */
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding-right: 6px;
+    scrollbar-width: thin;  /* Firefox */
+}
+
+/* Chrome, Edge, Safari */
+.recent-scroll::-webkit-scrollbar {
+    width: 8px;
+}
+
+.recent-scroll::-webkit-scrollbar-thumb {
+    background: #666;
+    border-radius: 4px;
+}
+
+.recent-scroll::-webkit-scrollbar-thumb:hover {
+    background: #888;
+}
+
+.recent-scroll::-webkit-scrollbar-track {
+    background: transparent;
+}
 </style></head><body><div class=wrap>
 <header><div class=brand><div class=logo>&#128274;</div><div><h1>SecureComm</h1>
 <div class=sub>blockchain auth + signaling relay &middot; single service</div></div></div>
@@ -187,7 +212,10 @@ footer{color:var(--muted);font-size:11px;text-align:center;margin-top:22px}
 </div>
 <div class=grid>
 <div class=panel><h2>&#128081; Connected now <span class=count id=onlinecount>0</span></h2><div id=online></div></div>
-<div class=panel><h2>&#9889; Recent activity</h2><div id=recent></div></div>
+<div class="panel">
+    <h2>&#9889; Recent Activity</h2>
+    <div id="recent" class="recent-scroll"></div>
+</div>
 </div>
 <div class=grid style="margin-top:16px">
 <div class=panel><h2>&#10133; Add user</h2>
