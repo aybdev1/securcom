@@ -253,6 +253,7 @@ tick();loadUsers();setInterval(()=>{tick();loadUsers();},2000);
 
 # ----------------------------------------------------------------------------- app
 app = Flask(__name__)
+app.config['SOCK_SERVER_OPTIONS'] = {'max_message_size': 24 * 1024 * 1024}  # allow large encrypted file frames
 sock = Sock(app)
 class UserDB:
     """SQLite user store for fast verification (easy to deploy/persist). The blockchain remains
@@ -455,6 +456,11 @@ def ws(ws):
             if to and to in peers:
                 msg["from"] = my_id
                 try: peers[to].send(json.dumps(msg))
+                except Exception: pass
+            elif to:
+                # Recipient is not connected — tell the SENDER instead of silently dropping,
+                # so "nothing happens" becomes a clear, diagnosable message.
+                try: ws.send(json.dumps({"type": "undeliverable", "to": to, "reason": "peer not connected"}))
                 except Exception: pass
     finally:
         if peers.get(my_id) is ws: del peers[my_id]
