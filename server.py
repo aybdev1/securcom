@@ -223,7 +223,7 @@ footer{color:var(--muted);font-size:11px;text-align:center;margin-top:22px}
 <input class=f id=np type=password placeholder="password (8+ chars)">
 <button class=b onclick=addUser()>Add user</button>
 <div class=msg id=addmsg></div></div>
-<div class=panel><h2>&#128101; Registered users <span class=count id=usercount class="recent-scroll" >0</span></h2><div id=users></div></div>
+<div class=panel><h2>&#128101; Registered users <span class=count id="usercount" class="recent-scroll" >0</span></h2><div id=users></div></div>
 </div>
 <footer>auto-refreshing every 2s &middot; uptime <span id=uptime>0s</span> &middot; this page shows usernames only (never passwords)</footer>
 </div>
