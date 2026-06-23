@@ -23,6 +23,7 @@ CHAIN_PATH     = os.environ.get("CHAIN_PATH", "chain.json")
 DB_PATH        = os.environ.get("DB_PATH", "users.db")
 POW_DIFFICULTY = int(os.environ.get("POW_DIFFICULTY", "3"))
 REQUIRE_AUTH   = os.environ.get("REQUIRE_AUTH", "1") == "1"
+REGISTRATION_OPEN = os.environ.get("REGISTRATION_OPEN", "1") == "1"  # set 0 to disable public sign-up
 ADMIN_KEY      = os.environ.get("ADMIN_KEY", "")  # if set, /delete-user requires header X-Admin-Key
 PBKDF2_ITERS   = 200_000
 
@@ -175,30 +176,24 @@ button.del:hover{background:rgba(255,77,77,.28)}
 .tag.reg{background:rgba(52,183,241,.16);color:var(--accent2)}.tag.log{background:rgba(37,211,102,.16);color:var(--accent)}
 .ago{margin-left:auto;color:var(--muted);font-size:12px}
 footer{color:var(--muted);font-size:11px;text-align:center;margin-top:22px}
-.recent-scroll {
-    max-height: 350px;      /* Adjust as needed */
-    overflow-y: auto;
-    overflow-x: hidden;
-    padding-right: 6px;
-    scrollbar-width: thin;  /* Firefox */
-}
+.users-scroll{
+  max-height: 380px;
+  overflow-y: auto;
+  padding-right: 8px;
 
-/* Chrome, Edge, Safari */
-.recent-scroll::-webkit-scrollbar {
-    width: 8px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--accent) transparent;
 }
-
-.recent-scroll::-webkit-scrollbar-thumb {
-    background: #666;
-    border-radius: 4px;
+/* Chrome / Edge / Safari */
+.users-scroll::-webkit-scrollbar{
+  width: 7px;
 }
-
-.recent-scroll::-webkit-scrollbar-thumb:hover {
-    background: #888;
+.users-scroll::-webkit-scrollbar-thumb{
+  background: linear-gradient(var(--accent), var(--accent2));
+  border-radius: 10px;
 }
-
-.recent-scroll::-webkit-scrollbar-track {
-    background: transparent;
+.users-scroll::-webkit-scrollbar-track{
+  background: transparent;
 }
 </style></head><body><div class=wrap>
 <header><div class=brand><div class=logo>&#128274;</div><div><h1>SecureComm</h1>
@@ -212,10 +207,7 @@ footer{color:var(--muted);font-size:11px;text-align:center;margin-top:22px}
 </div>
 <div class=grid>
 <div class=panel><h2>&#128081; Connected now <span class=count id=onlinecount>0</span></h2><div id=online></div></div>
-<div class="panel">
-    <h2>&#9889; Recent Activity</h2>
-    <div id="recent" class="recent-scroll"></div>
-</div>
+<div class=panel><h2>&#9889; Recent activity</h2>  <div class="users-scroll"><div id=recent></div></div></div>
 </div>
 <div class=grid style="margin-top:16px">
 <div class=panel><h2>&#10133; Add user</h2>
@@ -223,7 +215,7 @@ footer{color:var(--muted);font-size:11px;text-align:center;margin-top:22px}
 <input class=f id=np type=password placeholder="password (8+ chars)">
 <button class=b onclick=addUser()>Add user</button>
 <div class=msg id=addmsg></div></div>
-<div class=panel><h2>&#128101; Registered users <span class=count id="usercount" class="recent-scroll" >0</span></h2><div id=users></div></div>
+<div class=panel><h2>&#128101; Registered users <span class=count id=usercount>0</span></h2><div id=users></div></div>
 </div>
 <footer>auto-refreshing every 2s &middot; uptime <span id=uptime>0s</span> &middot; this page shows usernames only (never passwords)</footer>
 </div>
@@ -333,6 +325,43 @@ peers = {}
 peer_since = {}
 START_TS = time.time()
 
+# ---- Offline store-and-forward queue ----
+# When a recipient is briefly offline, queue their messages and flush on reconnect, so a
+# transient disconnect no longer means "undeliverable". Bounded by count + age to limit memory.
+import collections
+QUEUE_MAX_PER_USER = int(os.environ.get("QUEUE_MAX_PER_USER", "500"))
+QUEUE_TTL = int(os.environ.get("QUEUE_TTL", str(7 * 24 * 3600)))  # seconds
+pending = collections.defaultdict(collections.deque)  # id -> deque[(ts, msg_dict)]
+
+def _enqueue(to, msg):
+    q = pending[to]
+    now = time.time()
+    # prune expired
+    while q and (now - q[0][0]) > QUEUE_TTL:
+        q.popleft()
+    q.append((now, msg))
+    while len(q) > QUEUE_MAX_PER_USER:
+        q.popleft()
+    return len(q)
+
+def _flush(to, ws):
+    q = pending.get(to)
+    if not q:
+        return 0
+    now = time.time()
+    sent = 0
+    while q:
+        ts, msg = q.popleft()
+        if (now - ts) > QUEUE_TTL:
+            continue
+        try:
+            ws.send(json.dumps(msg)); sent += 1
+        except Exception:
+            q.appendleft((ts, msg)); break
+    if not q:
+        pending.pop(to, None)
+    return sent
+
 def _ip(): return request.headers.get("X-Forwarded-For", request.remote_addr or "?").split(",")[0].strip()
 
 CORS_ORIGIN = os.environ.get("CORS_ORIGIN", "*")  # set to your web origin in production
@@ -374,11 +403,16 @@ def stats():
 @app.get("/health")
 def health():
     return jsonify(status="ok", peers=len(peers), chain_valid=chain.is_valid(),
-                   blocks=len(chain.chain), auth_required=REQUIRE_AUTH)
+                   blocks=len(chain.chain), auth_required=REQUIRE_AUTH, registration_open=REGISTRATION_OPEN)
 
 @app.post("/register")
 def register():
     if not reg_limiter.allow(_ip()): return jsonify(error="rate limited"), 429
+    # Public registration can be turned off (REGISTRATION_OPEN=0). An admin presenting the
+    # X-Admin-Key may still create accounts even when public sign-up is disabled.
+    admin_ok = bool(ADMIN_KEY) and request.headers.get("X-Admin-Key", "") == ADMIN_KEY
+    if not REGISTRATION_OPEN and not admin_ok:
+        return jsonify(error="registration is disabled by the administrator"), 403
     b = request.get_json(silent=True) or {}
     u, p = b.get("username", ""), b.get("password", "")
     if not valid_username(u): return jsonify(error="invalid username (3-32: letters, digits, . _ -)"), 400
@@ -474,22 +508,52 @@ def ws(ws):
     peers[my_id] = ws
     peer_since[my_id] = time.time()
     ws.send(json.dumps({"type": "registered", "id": my_id}))
+    # Deliver anything that arrived while this user was offline.
+    flushed = _flush(my_id, ws)
+    if flushed:
+        try: ws.send(json.dumps({"type": "queued_delivered", "count": flushed}))
+        except Exception: pass
     try:
         while True:
             raw = ws.receive()
             if raw is None: break
             try: msg = json.loads(raw)
             except Exception: continue
+            mtype = msg.get("type")
+            # Heartbeat: keeps the connection alive through proxies; lets clients detect liveness.
+            if mtype == "ping":
+                try: ws.send(json.dumps({"type": "pong", "t": int(time.time())}))
+                except Exception: break
+                continue
             to = msg.get("to")
             if to and to in peers:
                 msg["from"] = my_id
-                try: peers[to].send(json.dumps(msg))
-                except Exception: pass
+                try:
+                    peers[to].send(json.dumps(msg))
+                except Exception:
+                    # The target socket died mid-send: queue and let them get it on reconnect.
+                    msg["from"] = my_id; depth = _enqueue(to, msg)
+                    try: ws.send(json.dumps({"type": "queued", "to": to, "depth": depth}))
+                    except Exception: pass
             elif to:
-                # Recipient is not connected — tell the SENDER instead of silently dropping,
-                # so "nothing happens" becomes a clear, diagnosable message.
-                try: ws.send(json.dumps({"type": "undeliverable", "to": to, "reason": "peer not connected"}))
-                except Exception: pass
+                msg["from"] = my_id
+                if mtype == "offer":
+                    # Recipient offline: record a MISSED CALL for delivery on reconnect. We do NOT
+                    # queue the raw offer (it would ring much later, long after the call is over).
+                    _enqueue(to, {"type": "missed_call", "from": my_id, "t": int(time.time()),
+                                  "profile": msg.get("profile")})
+                    try: ws.send(json.dumps({"type": "undeliverable", "to": to,
+                                             "reason": "peer offline — missed call recorded"}))
+                    except Exception: pass
+                elif mtype in ("answer", "ice", "bye"):
+                    # Live call signaling is useless if delivered late — drop it silently.
+                    pass
+                else:
+                    # Chat/key/file message: QUEUE it (store-and-forward) and tell the sender.
+                    depth = _enqueue(to, msg)
+                    try: ws.send(json.dumps({"type": "queued", "to": to, "depth": depth,
+                                             "reason": "peer offline — will deliver when they reconnect"}))
+                    except Exception: pass
     finally:
         if peers.get(my_id) is ws: del peers[my_id]
         peer_since.pop(my_id, None)
