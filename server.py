@@ -1,17 +1,4 @@
-"""SecureComm — single-file server: blockchain auth + token-gated signaling relay.
 
-ONE process, ONE port. Users register/login (HTTP) to get a token; the WebSocket relay
-(/ws) refuses any connection without a valid token. Everything below — token logic, password
-hashing, the tamper-evident hash-chain ('blockchain'), the auth API, and the relay — lives here.
-
-Run:    pip install flask flask-sock
-        AUTH_SECRET="a-long-random-secret" PORT=8080 python server.py
-Deploy: one Railway service. Start command: python server.py  (Railway sets PORT).
-        For scale:  gunicorn -k gevent -b 0.0.0.0:$PORT server:app
-
-HONEST SCOPE: the 'blockchain' is a single-node, proof-of-work, tamper-evident hash chain
-(an append-only audit ledger) — not a distributed consensus network.
-"""
 import os, json, time, hashlib, hmac, base64, re, threading, sqlite3
 from flask import Flask, request, jsonify
 from flask_sock import Sock
@@ -24,7 +11,7 @@ DB_PATH        = os.environ.get("DB_PATH", "users.db")
 POW_DIFFICULTY = int(os.environ.get("POW_DIFFICULTY", "3"))
 REQUIRE_AUTH   = os.environ.get("REQUIRE_AUTH", "1") == "1"
 REGISTRATION_OPEN = os.environ.get("REGISTRATION_OPEN", "1") == "1"  # set 0 to disable public sign-up
-ADMIN_KEY      = os.environ.get("ADMIN_KEY", "") # if set, /delete-user requires header X-Admin-Key
+ADMIN_KEY      = os.environ.get("ADMIN_KEY", "")  # if set, /delete-user requires header X-Admin-Key
 PBKDF2_ITERS   = 200_000
 
 # ----------------------------------------------------------------------------- tokens (HMAC)
@@ -179,26 +166,6 @@ button.del:hover{background:rgba(255,77,77,.28)}
 .tag.reg{background:rgba(52,183,241,.16);color:var(--accent2)}.tag.log{background:rgba(37,211,102,.16);color:var(--accent)}
 .ago{margin-left:auto;color:var(--muted);font-size:12px}
 footer{color:var(--muted);font-size:11px;text-align:center;margin-top:22px}
-.users-scroll{
-  max-height: 380px;
-  overflow-y: auto;
-  padding-right: 8px;
-
-  scrollbar-width: thin;
-  scrollbar-color: var(--accent) transparent;
-}
-/* Chrome / Edge / Safari */
-.users-scroll::-webkit-scrollbar{
-  width: 7px;
-}
-.users-scroll::-webkit-scrollbar-thumb{
-  background: linear-gradient(var(--accent), var(--accent2));
-  border-radius: 10px;
-}
-.users-scroll::-webkit-scrollbar-track{
-  background: transparent;
-}
-
 </style></head><body><div class=wrap>
 <header><div class=brand><div class=logo>&#128274;</div><div><h1>SecureComm</h1>
 <div class=sub>blockchain auth + signaling relay &middot; single service</div></div></div>
@@ -211,7 +178,7 @@ footer{color:var(--muted);font-size:11px;text-align:center;margin-top:22px}
 </div>
 <div class=grid>
 <div class=panel><h2>&#128081; Connected now <span class=count id=onlinecount>0</span></h2><div id=online></div></div>
-<div class=panel><h2>&#9889; Recent activity</h2>  <div class="users-scroll"><div id=recent></div></div></div>
+<div class=panel><h2>&#9889; Recent activity</h2><div id=recent></div></div>
 </div>
 <div class=grid style="margin-top:16px">
 <div class=panel><h2>&#10133; Add user</h2>
@@ -219,18 +186,7 @@ footer{color:var(--muted);font-size:11px;text-align:center;margin-top:22px}
 <input class=f id=np type=password placeholder="password (8+ chars)">
 <button class=b onclick=addUser()>Add user</button>
 <div class=msg id=addmsg></div></div>
-<div class="panel">
-  <h2>
-    &#128101; Registered users
-    <span class="count" id="usercount">0</span>
-  </h2>
-
-  <div class="users-scroll">
-    <div id="users"></div>
-  </div>
-</div>
-</div>
-
+<div class=panel><h2>&#128101; Registered users <span class=count id=usercount>0</span></h2><div id=users></div></div>
 <div class=panel><h2>&#9888;&#65039; Danger zone</h2>
 <p style="font-size:13px;color:var(--muted);margin:-4px 0 12px">Irreversible. If the server has an ADMIN_KEY set, you'll be asked for it once.</p>
 <button class=b style="background:#92400e" onclick=resetChain()>Reset blockchain &middot; keep users</button>
@@ -361,8 +317,29 @@ chain = Blockchain()
 db = UserDB(DB_PATH)
 reg_limiter = RateLimiter(max_hits=5, window=60)
 login_limiter = RateLimiter(max_hits=10, window=60)
-peers = {}
+peers = {}          # id -> list[ws]  (multi-device: one account can be signed in on many devices)
 peer_since = {}
+
+def _send_all(uid, msg):
+    """Multi-device fan-out: deliver to EVERY socket signed in as uid. Returns count delivered."""
+    sent = 0
+    for sock in list(peers.get(uid, [])):
+        try:
+            sock.send(json.dumps(msg)); sent += 1
+        except Exception:
+            lst = peers.get(uid)
+            if lst and sock in lst: lst.remove(sock)
+    return sent
+
+def _send_others(uid, exclude, msg):
+    """Mirror to the sender's OTHER devices (not the originating socket)."""
+    for sock in list(peers.get(uid, [])):
+        if sock is exclude: continue
+        try:
+            sock.send(json.dumps(msg))
+        except Exception:
+            lst = peers.get(uid)
+            if lst and sock in lst: lst.remove(sock)
 START_TS = time.time()
 
 # ---- Offline store-and-forward queue ----
@@ -516,10 +493,10 @@ def delete_user():
         return jsonify(error="no such user"), 404
     db.delete(u)
     chain.add_block({"type": "delete", "username": u})   # tamper-evident revocation record
-    ws = peers.pop(u, None)                               # kick them off the relay immediately
+    socks = peers.pop(u, None)                            # kick every device off the relay immediately
     peer_since.pop(u, None)
-    if ws is not None:
-        try: ws.close()
+    for sock in (socks or []):
+        try: sock.close()
         except Exception: pass
     return jsonify(deleted=True, username=u)
 
@@ -578,7 +555,7 @@ def ws(ws):
             finally: return
     if not my_id:
         ws.send(json.dumps({"type": "error", "error": "missing id"})); return
-    peers[my_id] = ws
+    peers.setdefault(my_id, []).append(ws)   # multi-device: add this socket to the account's device list
     peer_since[my_id] = time.time()
     ws.send(json.dumps({"type": "registered", "id": my_id}))
     # Deliver anything that arrived while this user was offline.
@@ -599,12 +576,16 @@ def ws(ws):
                 except Exception: break
                 continue
             to = msg.get("to")
-            if to and to in peers:
+            if to and peers.get(to):
                 msg["from"] = my_id
-                try:
-                    peers[to].send(json.dumps(msg))
-                except Exception:
-                    # The target socket died mid-send: queue and let them get it on reconnect.
+                # Deliver to ALL of the recipient's devices (phone + web + …) so the same
+                # message / call rings on every device they are signed in on.
+                delivered = _send_all(to, msg)
+                # Mirror it to the SENDER's other devices too, so your own conversation stays
+                # in sync across your devices (flagged so clients render it as your outgoing item).
+                if mtype not in ("answer", "ice", "bye"):
+                    _send_others(my_id, ws, dict(msg, **{"from": my_id, "to": to, "sync": True}))
+                if delivered == 0:
                     msg["from"] = my_id; depth = _enqueue(to, msg)
                     try: ws.send(json.dumps({"type": "queued", "to": to, "depth": depth}))
                     except Exception: pass
@@ -628,8 +609,12 @@ def ws(ws):
                                              "reason": "peer offline — will deliver when they reconnect"}))
                     except Exception: pass
     finally:
-        if peers.get(my_id) is ws: del peers[my_id]
-        peer_since.pop(my_id, None)
+        lst = peers.get(my_id)
+        if lst and ws in lst:
+            lst.remove(ws)
+            if not lst:
+                del peers[my_id]
+                peer_since.pop(my_id, None)
 
 if __name__ == "__main__":
     # threaded=True so HTTP auth calls and multiple WebSocket relays run concurrently.
