@@ -24,7 +24,7 @@ DB_PATH        = os.environ.get("DB_PATH", "users.db")
 POW_DIFFICULTY = int(os.environ.get("POW_DIFFICULTY", "3"))
 REQUIRE_AUTH   = os.environ.get("REQUIRE_AUTH", "1") == "1"
 REGISTRATION_OPEN = os.environ.get("REGISTRATION_OPEN", "1") == "1"  # set 0 to disable public sign-up
-ADMIN_KEY      = os.environ.get("ADMIN_KEY", "") =="securcom" # if set, /delete-user requires header X-Admin-Key
+ADMIN_KEY      = os.environ.get("ADMIN_KEY", "") # if set, /delete-user requires header X-Admin-Key
 PBKDF2_ITERS   = 200_000
 
 # ----------------------------------------------------------------------------- tokens (HMAC)
