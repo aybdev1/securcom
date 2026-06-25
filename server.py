@@ -18,7 +18,7 @@ from flask_sock import Sock
 
 # ----------------------------------------------------------------------------- config
 AUTH_SECRET    = os.environ.get("AUTH_SECRET", "change-me-please-shared-secret")
-TOKEN_TTL      = int(os.environ.get("TOKEN_TTL", "3600"))
+TOKEN_TTL      = int(os.environ.get("TOKEN_TTL", "2592000"))  # 30 days. (Was 3600=1h, which dropped clients off the relay after an hour because the WS reconnect kept presenting an expired token.)
 CHAIN_PATH     = os.environ.get("CHAIN_PATH", "chain.json")
 DB_PATH        = os.environ.get("DB_PATH", "users.db")
 POW_DIFFICULTY = int(os.environ.get("POW_DIFFICULTY", "3"))
@@ -127,6 +127,9 @@ class Blockchain:
     def _load(self):
         with open(self.path) as f: raw = json.load(f)
         self.chain = [Block(b["index"], b["timestamp"], b["data"], b["previous_hash"], b["nonce"]) for b in raw]
+    def reset(self):
+        """Wipe every block and start a brand-new chain from a fresh genesis block."""
+        self.chain = []; self._genesis(); return len(self.chain)
 
 # ----------------------------------------------------------------------------- dashboard
 DASHBOARD_HTML = """<!DOCTYPE html><html lang=en><head><meta charset=utf-8>
@@ -195,6 +198,7 @@ footer{color:var(--muted);font-size:11px;text-align:center;margin-top:22px}
 .users-scroll::-webkit-scrollbar-track{
   background: transparent;
 }
+
 </style></head><body><div class=wrap>
 <header><div class=brand><div class=logo>&#128274;</div><div><h1>SecureComm</h1>
 <div class=sub>blockchain auth + signaling relay &middot; single service</div></div></div>
@@ -225,6 +229,14 @@ footer{color:var(--muted);font-size:11px;text-align:center;margin-top:22px}
     <div id="users"></div>
   </div>
 </div>
+</div>
+
+<div class=panel><h2>&#9888;&#65039; Danger zone</h2>
+<p style="font-size:13px;color:var(--muted);margin:-4px 0 12px">Irreversible. If the server has an ADMIN_KEY set, you'll be asked for it once.</p>
+<button class=b style="background:#92400e" onclick=resetChain()>Reset blockchain &middot; keep users</button>
+<div style="height:8px"></div>
+<button class=b style="background:#991b1b" onclick=resetAll()>Reset EVERYTHING &middot; delete all users + chain</button>
+<div class=msg id=dangermsg></div></div>
 </div>
 <footer>auto-refreshing every 2s &middot; uptime <span id=uptime>0s</span> &middot; this page shows usernames only (never passwords)</footer>
 </div>
@@ -265,6 +277,20 @@ async function deleteUser(u){
   else{m.style.color='var(--danger)';m.textContent='✗ '+(j.error||('HTTP '+r.status));}
  }catch(e){}
 }
+function _adminHeaders(){ const k=localStorage.getItem('sc_admin_key')||''; const h={'Content-Type':'application/json'}; if(k) h['X-Admin-Key']=k; return h; }
+async function _adminPost(url, confirmMsg){
+ if(!confirm(confirmMsg)) return;
+ let key=localStorage.getItem('sc_admin_key');
+ if(key===null){ key=prompt('Admin key (leave blank if none is configured on the server):',''); if(key===null) return; localStorage.setItem('sc_admin_key', key); }
+ const m=document.getElementById('dangermsg'); m.style.color='var(--muted)'; m.textContent='Working…';
+ try{
+  const r=await fetch(url,{method:'POST',headers:_adminHeaders()}); const j=await r.json().catch(()=>({}));
+  if(r.ok){ m.style.color='var(--accent)'; m.textContent='\u2713 '+(j.action||'done')+': blocks='+j.blocks+(j.users_deleted!=null?(', users deleted='+j.users_deleted):''); loadUsers(); }
+  else{ m.style.color='var(--danger)'; m.textContent='\u2717 '+(j.error||('HTTP '+r.status)); if(r.status===403) localStorage.removeItem('sc_admin_key'); }
+ }catch(e){ m.style.color='var(--danger)'; m.textContent='\u2717 '+e.message; }
+}
+function resetChain(){ _adminPost('/admin/reset-chain','Delete the ENTIRE blockchain and start a fresh genesis block? Users are kept.'); }
+function resetAll(){ _adminPost('/admin/reset-all','DELETE EVERYTHING \u2014 all users, the whole blockchain, all sessions. This cannot be undone. Continue?'); }
 async function addUser(){
  const u=document.getElementById('nu').value.trim(), p=document.getElementById('np').value;
  const m=document.getElementById('addmsg');
@@ -323,6 +349,11 @@ class UserDB:
         with self._lock:
             self.conn.execute("UPDATE users SET identity=? WHERE username=?", (identity, username))
             self.conn.commit()
+    def delete_all(self):
+        with self._lock:
+            n = self.conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            self.conn.execute("DELETE FROM users"); self.conn.commit()
+            return n
 
 def fp_of(identity): return hashlib.sha256((identity or "").encode()).hexdigest()[:32] if identity else ""
 
@@ -491,6 +522,39 @@ def delete_user():
         try: ws.close()
         except Exception: pass
     return jsonify(deleted=True, username=u)
+
+def _admin_ok():
+    """Admin gate: a matching X-Admin-Key when ADMIN_KEY is set; otherwise only the local
+    machine (no key configured = local-only admin, never open to the internet)."""
+    if ADMIN_KEY:
+        return request.headers.get("X-Admin-Key", "") == ADMIN_KEY
+    return _ip() in ("127.0.0.1", "::1", "localhost")
+
+def _kick_all_peers():
+    for pid, ws in list(peers.items()):
+        try: ws.close()
+        except Exception: pass
+    peers.clear(); peer_since.clear(); pending.clear()
+
+@app.post("/admin/reset-chain")
+def admin_reset_chain():
+    """Delete the entire blockchain and re-create a fresh genesis block. Users are kept."""
+    if not _admin_ok():
+        return jsonify(error="admin key required (set ADMIN_KEY and send X-Admin-Key)"), 403
+    blocks = chain.reset()
+    return jsonify(status="ok", action="reset-chain", blocks=blocks, chain_valid=chain.is_valid())
+
+@app.post("/admin/reset-all")
+def admin_reset_all():
+    """Full wipe: reset the chain to genesis, delete ALL users, drop all online peers and
+    queued messages. The server returns to a clean, just-installed state."""
+    if not _admin_ok():
+        return jsonify(error="admin key required (set ADMIN_KEY and send X-Admin-Key)"), 403
+    users = db.delete_all()
+    blocks = chain.reset()
+    _kick_all_peers()
+    return jsonify(status="ok", action="reset-all", users_deleted=users,
+                   blocks=blocks, chain_valid=chain.is_valid(), peers=len(peers))
 
 @app.get("/users")
 def users_list():
