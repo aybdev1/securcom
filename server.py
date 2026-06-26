@@ -313,9 +313,38 @@ class UserDB:
 def fp_of(identity): return hashlib.sha256((identity or "").encode()).hexdigest()[:32] if identity else ""
 
 chain = Blockchain()
+
+@app.after_request
+def _cors(resp):
+    # Allow the browser web client (possibly a different origin) to reach the HTTP API
+    # (notarization / verification). The relay itself stays token-gated over WebSocket.
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Admin-Key"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return resp
 db = UserDB(DB_PATH)
 reg_limiter = RateLimiter(max_hits=5, window=60)
 login_limiter = RateLimiter(max_hits=10, window=60)
+proof_limiter = RateLimiter(max_hits=60, window=60)   # on-chain notarization is cheap but rate-limited
+
+# ---- Threat detection / security analytics ----
+SEC_EVENTS_MAX = 500
+security_events = []           # rolling audit of security-relevant events
+sec_counters = {}              # kind -> count (for risk scoring / monitoring)
+def _log_event(kind, detail="", ip=None):
+    try:
+        security_events.append({"t": int(time.time()), "kind": kind, "detail": str(detail)[:120], "ip": ip})
+        extra = len(security_events) - SEC_EVENTS_MAX
+        if extra > 0: del security_events[0:extra]
+        sec_counters[kind] = sec_counters.get(kind, 0) + 1
+    except Exception:
+        pass
+def _risk_score():
+    """A simple 0-100 server risk score derived from recent anomalies (higher = riskier)."""
+    fails = sec_counters.get("failed_login", 0)
+    rl = sec_counters.get("rate_limited", 0)
+    score = min(100, fails * 2 + rl * 3)
+    return score
 peers = {}          # id -> list[ws]  (multi-device: one account can be signed in on many devices)
 peer_since = {}
 
@@ -421,9 +450,37 @@ def health():
     return jsonify(status="ok", peers=len(peers), chain_valid=chain.is_valid(),
                    blocks=len(chain.chain), auth_required=REQUIRE_AUTH, registration_open=REGISTRATION_OPEN)
 
+@app.post("/proof")
+def anchor_proof():
+    """Tamper-evident notarization. Anchor a message's content hash (sha256 of the ciphertext)
+    into the blockchain to create an immutable, timestamped proof that the message existed at a
+    point in time and has not been altered. Neither WhatsApp nor Signal offers on-chain proofs."""
+    if not proof_limiter.allow(_ip()):
+        return jsonify(error="rate limited"), 429
+    body = request.get_json(silent=True) or {}
+    h = str(body.get("hash", "")).lower().strip()
+    if len(h) != 64 or any(c not in "0123456789abcdef" for c in h):
+        return jsonify(error="hash must be 64-char hex (sha256)"), 400
+    sender = str(body.get("from", ""))[:64]
+    blk = chain.add_block({"type": "proof", "hash": h, "from": sender, "t": int(time.time())})
+    return jsonify(ok=True, index=blk.index, anchored_at=int(blk.timestamp),
+                   block_hash=blk.compute_hash(), chain_valid=chain.is_valid())
+
+@app.get("/verify/<h>")
+def verify_proof(h):
+    """Check whether a content hash has been anchored on-chain, and whether the chain is intact."""
+    h = (h or "").lower().strip()
+    for b in chain.chain:
+        d = b.data if isinstance(b.data, dict) else {}
+        if d.get("type") == "proof" and d.get("hash") == h:
+            return jsonify(anchored=True, index=b.index, anchored_at=int(b.timestamp),
+                           by=d.get("from", ""), chain_valid=chain.is_valid())
+    return jsonify(anchored=False, chain_valid=chain.is_valid())
+
 @app.post("/register")
 def register():
-    if not reg_limiter.allow(_ip()): return jsonify(error="rate limited"), 429
+    if not reg_limiter.allow(_ip()):
+        _log_event("rate_limited", "register", _ip()); return jsonify(error="rate limited"), 429
     # Public registration can be turned off (REGISTRATION_OPEN=0). An admin presenting the
     # X-Admin-Key may still create accounts even when public sign-up is disabled.
     admin_ok = bool(ADMIN_KEY) and request.headers.get("X-Admin-Key", "") == ADMIN_KEY
@@ -443,17 +500,20 @@ def register():
 
 @app.post("/login")
 def login():
-    if not login_limiter.allow(_ip()): return jsonify(error="rate limited"), 429
+    if not login_limiter.allow(_ip()):
+        _log_event("rate_limited", "login", _ip()); return jsonify(error="rate limited"), 429
     b = request.get_json(silent=True) or {}
     u, p = b.get("username", ""), b.get("password", "")
     rec = db.get(u) if valid_username(u) else None
     ok = verify_password(p, rec["salt"], rec["pwd_hash"]) if rec else verify_password(p, "00"*16, "ff"*32)
-    if not rec or not ok: return jsonify(error="invalid credentials"), 401
+    if not rec or not ok:
+        _log_event("failed_login", u, _ip()); return jsonify(error="invalid credentials"), 401
     identity = (b.get("identity") or "")[:512]
     if identity and not (rec.get("identity") or ""):       # first-login identity binding
         db.update_identity(u, identity)
         chain.add_block({"type": "bind_identity", "username": u, "identity_fp": fp_of(identity)})
     chain.add_block({"type": "login", "username": u})
+    _log_event("login", u, _ip())
     return jsonify(token=make_token(u), username=u, identity_fp=fp_of(identity or rec.get("identity"))), 200
 
 @app.post("/validate")
@@ -507,9 +567,10 @@ def _admin_ok():
     return _ip() in ("127.0.0.1", "::1", "localhost")
 
 def _kick_all_peers():
-    for pid, ws in list(peers.items()):
-        try: ws.close()
-        except Exception: pass
+    for pid, socks in list(peers.items()):
+        for ws in (socks or []):
+            try: ws.close()
+            except Exception: pass
     peers.clear(); peer_since.clear(); pending.clear()
 
 @app.post("/admin/reset-chain")
@@ -531,6 +592,31 @@ def admin_reset_all():
     _kick_all_peers()
     return jsonify(status="ok", action="reset-all", users_deleted=users,
                    blocks=blocks, chain_valid=chain.is_valid(), peers=len(peers))
+
+@app.get("/admin/security")
+def admin_security():
+    """Enterprise security monitoring: live posture, anomaly counters, and a rolling audit log."""
+    if not _admin_ok():
+        return jsonify(error="admin key required"), 403
+    return jsonify(
+        chain_valid=chain.is_valid(), blocks=len(chain.chain),
+        users=db.count(), online=len(peers),
+        devices=sum(len(v) for v in peers.values()),
+        registration_open=REGISTRATION_OPEN,
+        risk_score=_risk_score(), counters=dict(sec_counters),
+        recent_events=security_events[-50:],
+    )
+
+@app.post("/admin/registration")
+def admin_registration():
+    """Enterprise admin control: open/close public sign-up at runtime."""
+    if not _admin_ok():
+        return jsonify(error="admin key required"), 403
+    global REGISTRATION_OPEN
+    body = request.get_json(silent=True) or {}
+    REGISTRATION_OPEN = bool(body.get("open", True))
+    _log_event("admin_registration", "open" if REGISTRATION_OPEN else "closed", _ip())
+    return jsonify(ok=True, registration_open=REGISTRATION_OPEN)
 
 @app.get("/users")
 def users_list():
