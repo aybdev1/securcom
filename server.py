@@ -1,3 +1,17 @@
+"""SecureComm — single-file server: blockchain auth + token-gated signaling relay.
+
+ONE process, ONE port. Users register/login (HTTP) to get a token; the WebSocket relay
+(/ws) refuses any connection without a valid token. Everything below — token logic, password
+hashing, the tamper-evident hash-chain ('blockchain'), the auth API, and the relay — lives here.
+
+Run:    pip install flask flask-sock
+        AUTH_SECRET="a-long-random-secret" PORT=8080 python server.py
+Deploy: one Railway service. Start command: python server.py  (Railway sets PORT).
+        For scale:  gunicorn -k gevent -b 0.0.0.0:$PORT server:app
+
+HONEST SCOPE: the 'blockchain' is a single-node, proof-of-work, tamper-evident hash chain
+(an append-only audit ledger) — not a distributed consensus network.
+"""
 import os, json, time, hashlib, hmac, base64, re, threading, sqlite3
 from flask import Flask, request, jsonify
 from flask_sock import Sock
@@ -668,7 +682,7 @@ def ws(ws):
                 delivered = _send_all(to, msg)
                 # Mirror it to the SENDER's other devices too, so your own conversation stays
                 # in sync across your devices (flagged so clients render it as your outgoing item).
-                if mtype not in ("answer", "ice", "bye"):
+                if mtype not in ("answer", "ice", "bye", "typing", "receipt"):
                     _send_others(my_id, ws, dict(msg, **{"from": my_id, "to": to, "sync": True}))
                 if delivered == 0:
                     msg["from"] = my_id; depth = _enqueue(to, msg)
@@ -684,7 +698,7 @@ def ws(ws):
                     try: ws.send(json.dumps({"type": "undeliverable", "to": to,
                                              "reason": "peer offline — missed call recorded"}))
                     except Exception: pass
-                elif mtype in ("answer", "ice", "bye"):
+                elif mtype in ("answer", "ice", "bye", "typing", "receipt"):
                     # Live call signaling is useless if delivered late — drop it silently.
                     pass
                 else:
