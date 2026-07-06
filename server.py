@@ -13,7 +13,7 @@ HONEST SCOPE: the 'blockchain' is a single-node, proof-of-work, tamper-evident h
 (an append-only audit ledger) — not a distributed consensus network.
 """
 import os, json, time, hashlib, hmac, base64, re, threading, sqlite3
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect
 from flask_sock import Sock
 
 # ----------------------------------------------------------------------------- config
@@ -25,6 +25,10 @@ POW_DIFFICULTY = int(os.environ.get("POW_DIFFICULTY", "3"))
 REQUIRE_AUTH   = os.environ.get("REQUIRE_AUTH", "1") == "1"
 REGISTRATION_OPEN = os.environ.get("REGISTRATION_OPEN", "1") == "1"  # set 0 to disable public sign-up
 ADMIN_KEY      = os.environ.get("ADMIN_KEY", "")  # if set, /delete-user requires header X-Admin-Key
+# ---- Admin account (login form gates the dashboard + admin actions) ----
+ADMIN_USERNAME     = os.environ.get("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD     = os.environ.get("ADMIN_PASSWORD", "admin")   # DEFAULT admin/admin — change via env in production!
+ADMIN_SESSION_TTL  = int(os.environ.get("ADMIN_SESSION_TTL", "86400"))  # 24h admin session
 PBKDF2_ITERS   = 200_000
 
 # ----------------------------------------------------------------------------- tokens (HMAC)
@@ -65,6 +69,33 @@ def verify_password(password, salt_hex, hash_hex):
 
 def valid_username(u): return bool(u) and bool(_USERNAME_RE.match(u))
 def valid_password(p): return isinstance(p, str) and 8 <= len(p) <= 128
+
+# ----------------------------------------------------------------------------- admin login/session
+# The admin password is hashed once at startup (PBKDF2) so the plaintext isn't kept around.
+_ADMIN_SALT, _ADMIN_HASH = hash_password(ADMIN_PASSWORD)
+
+def make_admin_token(ttl=ADMIN_SESSION_TTL):
+    payload = {"sub": ADMIN_USERNAME, "role": "admin",
+               "exp": int(time.time()) + int(ttl), "iat": int(time.time())}
+    p = _b64(json.dumps(payload, separators=(",", ":")).encode())
+    sig = hmac.new(AUTH_SECRET.encode(), (p + "|adm").encode(), hashlib.sha256).digest()
+    return p + "." + _b64(sig)
+
+def verify_admin_token(token):
+    try:
+        p, s = token.split(".", 1)
+        expected = hmac.new(AUTH_SECRET.encode(), (p + "|adm").encode(), hashlib.sha256).digest()
+        if not hmac.compare_digest(_unb64(s), expected):
+            return False
+        payload = json.loads(_unb64(p))
+        if int(payload.get("exp", 0)) < int(time.time()):
+            return False
+        return payload.get("role") == "admin"
+    except Exception:
+        return False
+
+def check_admin_login(username, password):
+    return (username == ADMIN_USERNAME) and verify_password(password, _ADMIN_SALT, _ADMIN_HASH)
 
 class RateLimiter:
     def __init__(self, max_hits=10, window=60):
@@ -207,7 +238,8 @@ footer{color:var(--muted);font-size:11px;text-align:center;margin-top:22px}
 <button class=b style="background:#991b1b" onclick=resetAll()>Reset EVERYTHING &middot; delete all users + chain</button>
 <div class=msg id=dangermsg></div></div>
 </div>
-<footer>auto-refreshing every 2s &middot; uptime <span id=uptime>0s</span> &middot; this page shows usernames only (never passwords)</footer>
+<footer>auto-refreshing every 2s &middot; uptime <span id=uptime>0s</span> &middot; this page shows usernames only (never passwords) &middot; <a href="#" onclick="scLogout();return false" style="color:var(--accent2)">sign out</a></footer>
+<script>async function scLogout(){try{await fetch('/admin/logout',{method:'POST',credentials:'same-origin'});}catch(e){}location.href='/admin/login';}</script>
 </div>
 <script>
 function ago(s){if(s<60)return s+'s';if(s<3600)return Math.floor(s/60)+'m';if(s<86400)return Math.floor(s/3600)+'h';return Math.floor(s/86400)+'d';}
@@ -339,6 +371,7 @@ def _cors(resp):
 db = UserDB(DB_PATH)
 reg_limiter = RateLimiter(max_hits=5, window=60)
 login_limiter = RateLimiter(max_hits=10, window=60)
+admin_login_limiter = RateLimiter(max_hits=5, window=60)   # throttle admin login guesses
 proof_limiter = RateLimiter(max_hits=60, window=60)   # on-chain notarization is cheap but rate-limited
 
 # ---- Threat detection / security analytics ----
@@ -440,9 +473,89 @@ def _hdr(r):
     r.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     return r
 
+LOGIN_HTML = """<!DOCTYPE html><html lang=en><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>SecureComm Server — Admin Login</title>
+<style>
+:root{--bg:#0b1220;--card:#111a2e;--muted:#7c8aa5;--accent:#0A9E86;--accent2:#12E1B6;--danger:#ef4444;--line:#1e293b}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+background:radial-gradient(1200px 600px at 50% -10%,#0f1e33,#0b1220);font-family:system-ui,Segoe UI,Roboto,sans-serif;color:#e5edf7}
+.card{width:340px;max-width:92vw;background:var(--card);border:1px solid var(--line);border-radius:16px;padding:26px 24px;
+box-shadow:0 20px 60px rgba(0,0,0,.45)}
+.logo{display:flex;align-items:center;gap:9px;font-weight:800;font-size:19px;margin-bottom:2px}
+.dot{width:12px;height:12px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--accent2))}
+.sub{color:var(--muted);font-size:12.5px;margin-bottom:18px}
+label{display:block;font-size:12px;color:var(--muted);margin:12px 0 5px}
+input{width:100%;padding:11px 12px;background:#0b1424;border:1px solid var(--line);border-radius:9px;color:#e5edf7;font-size:14px;outline:none}
+input:focus{border-color:var(--accent)}
+button{width:100%;margin-top:18px;padding:11px;border:0;border-radius:9px;font-weight:700;font-size:14px;cursor:pointer;
+background:linear-gradient(135deg,var(--accent),var(--accent2));color:#04231d}
+button:disabled{opacity:.6;cursor:default}
+.msg{margin-top:12px;font-size:12.5px;min-height:16px}
+.hint{margin-top:16px;font-size:11px;color:var(--muted);line-height:1.5}
+</style></head><body>
+<form class=card onsubmit="return doLogin(event)">
+  <div class=logo><span class=dot></span> SecureComm Server</div>
+  <div class=sub>Administrator sign-in</div>
+  <label for=u>Username</label>
+  <input id=u autocomplete=username autofocus value="admin">
+  <label for=p>Password</label>
+  <input id=p type=password autocomplete=current-password placeholder="\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022">
+  <button id=b type=submit>Sign in</button>
+  <div class=msg id=m></div>
+  <div class=hint>Default account is <b>admin / admin</b>. Set <code>ADMIN_USERNAME</code> and <code>ADMIN_PASSWORD</code> environment variables to change it before exposing the server.</div>
+</form>
+<script>
+async function doLogin(e){
+  e.preventDefault();
+  const b=document.getElementById('b'), m=document.getElementById('m');
+  b.disabled=true; m.style.color='var(--muted)'; m.textContent='Signing in\u2026';
+  try{
+    const r=await fetch('/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},
+      credentials:'same-origin',
+      body:JSON.stringify({username:document.getElementById('u').value,password:document.getElementById('p').value})});
+    const j=await r.json().catch(()=>({}));
+    if(r.ok && j.ok){ m.style.color='var(--accent2)'; m.textContent='\u2713 Welcome'; location.href=j.redirect||'/'; }
+    else { m.style.color='var(--danger)'; m.textContent='\u2717 '+(j.error||('HTTP '+r.status)); b.disabled=false; }
+  }catch(err){ m.style.color='var(--danger)'; m.textContent='\u2717 '+err.message; b.disabled=false; }
+  return false;
+}
+</script></body></html>"""
+
 @app.get("/")
 def home():
+    if not _admin_ok():
+        return redirect("/admin/login")
     return DASHBOARD_HTML
+
+@app.get("/admin/login")
+def admin_login_form():
+    if _admin_ok():
+        return redirect("/")
+    return LOGIN_HTML
+
+@app.post("/admin/login")
+def admin_login():
+    if not admin_login_limiter.allow(_ip()):
+        _log_event("rate_limited", "admin_login", _ip())
+        return jsonify(error="too many attempts — wait a minute"), 429
+    body = request.get_json(silent=True) or request.form or {}
+    username = (body.get("username") or "").strip()
+    password = body.get("password") or ""
+    if check_admin_login(username, password):
+        resp = jsonify(ok=True, redirect="/")
+        resp.set_cookie("sc_admin_session", make_admin_token(),
+                        max_age=ADMIN_SESSION_TTL, httponly=True, samesite="Lax", path="/")
+        _log_event("admin_login", username, _ip())
+        return resp
+    _log_event("admin_login_fail", username or "?", _ip())
+    return jsonify(error="invalid username or password"), 401
+
+@app.post("/admin/logout")
+def admin_logout():
+    resp = jsonify(ok=True, redirect="/admin/login")
+    resp.delete_cookie("sc_admin_session", path="/")
+    return resp
 
 @app.get("/stats")
 def stats():
@@ -574,11 +687,15 @@ def delete_user():
     return jsonify(deleted=True, username=u)
 
 def _admin_ok():
-    """Admin gate: a matching X-Admin-Key when ADMIN_KEY is set; otherwise only the local
-    machine (no key configured = local-only admin, never open to the internet)."""
-    if ADMIN_KEY:
-        return request.headers.get("X-Admin-Key", "") == ADMIN_KEY
-    return _ip() in ("127.0.0.1", "::1", "localhost")
+    """Admin gate. Requires either a valid admin-session cookie (from the login form using the
+    admin account) or a matching X-Admin-Key header. There is no implicit local bypass:
+    the dashboard and admin actions always require signing in with the admin account."""
+    tok = request.cookies.get("sc_admin_session", "")
+    if tok and verify_admin_token(tok):
+        return True
+    if ADMIN_KEY and request.headers.get("X-Admin-Key", "") == ADMIN_KEY:
+        return True
+    return False
 
 def _kick_all_peers():
     for pid, socks in list(peers.items()):
@@ -716,5 +833,16 @@ def ws(ws):
                 peer_since.pop(my_id, None)
 
 if __name__ == "__main__":
+    _port = int(os.environ.get("PORT", "8080"))
+    print("=" * 62)
+    print(" SecureComm server starting on port %d" % _port)
+    print(" Admin dashboard : http://localhost:%d/  (login required)" % _port)
+    print(" Admin account   : username '%s'" % ADMIN_USERNAME)
+    if ADMIN_PASSWORD == "admin":
+        print(" !! WARNING: using the DEFAULT admin password 'admin'.")
+        print(" !! Set ADMIN_USERNAME and ADMIN_PASSWORD env vars before exposing this server.")
+    if AUTH_SECRET == "change-me-please-shared-secret":
+        print(" !! WARNING: default AUTH_SECRET — set a strong AUTH_SECRET env var in production.")
+    print("=" * 62)
     # threaded=True so HTTP auth calls and multiple WebSocket relays run concurrently.
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")), threaded=True)
+    app.run(host="0.0.0.0", port=_port, threaded=True)
