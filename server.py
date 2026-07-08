@@ -395,6 +395,36 @@ def _risk_score():
 peers = {}          # id -> list[ws]  (multi-device: one account can be signed in on many devices)
 peer_since = {}
 
+# ---------------------------------------------------------------- public rooms (open, joinable by anyone)
+# room_id -> {"name", "owner", "created", "sockets": set(ws), "history": [last N messages]}
+rooms = {}
+ROOM_HISTORY = 50
+
+def _room_public(rid, r):
+    return {"id": rid, "name": r["name"], "owner": r.get("owner", "?"),
+            "members": len(r["sockets"]), "created": int(r["created"])}
+
+def _broadcast_room(rid, msg, exclude=None):
+    r = rooms.get(rid)
+    if not r:
+        return 0
+    sent = 0
+    for s in list(r["sockets"]):
+        if s is exclude:
+            continue
+        try:
+            s.send(json.dumps(msg)); sent += 1
+        except Exception:
+            r["sockets"].discard(s)
+    return sent
+
+def _leave_all_rooms(ws):
+    for rid, r in list(rooms.items()):
+        if ws in r["sockets"]:
+            r["sockets"].discard(ws)
+            _broadcast_room(rid, {"type": "room_presence", "room": rid, "members": len(r["sockets"])})
+
+
 def _send_all(uid, msg):
     """Multi-device fan-out: deliver to EVERY socket signed in as uid. Returns count delivered."""
     sent = 0
@@ -760,6 +790,30 @@ def get_chain():
     return jsonify(length=len(chain.chain), valid=chain.is_valid(),
                    chain=[b.to_dict() for b in chain.chain])
 
+@app.get("/rooms")
+def list_rooms():
+    """Public rooms are visible to every signed-in user."""
+    if REQUIRE_AUTH and not verify_token(request.args.get("token", "")):
+        return jsonify(error="unauthorized"), 401
+    return jsonify(rooms=[_room_public(rid, r) for rid, r in rooms.items()])
+
+@app.post("/rooms")
+def create_room():
+    """Anyone signed in can create a public room; it then shows up in GET /rooms for all users."""
+    body = request.get_json(silent=True) or {}
+    owner = "anon"
+    if REQUIRE_AUTH:
+        sub = verify_token(body.get("token", "") or request.args.get("token", ""))
+        if not sub:
+            return jsonify(error="unauthorized"), 401
+        owner = sub
+    else:
+        owner = (body.get("owner") or "anon")
+    name = ((body.get("name") or "Room").strip() or "Room")[:60]
+    rid = "room_" + os.urandom(5).hex()
+    rooms[rid] = {"name": name, "owner": owner, "created": time.time(), "sockets": set(), "history": []}
+    return jsonify(ok=True, room=_room_public(rid, rooms[rid]))
+
 @sock.route("/ws")
 def ws(ws):
     my_id, token = request.args.get("id", ""), request.args.get("token", "")
@@ -790,6 +844,32 @@ def ws(ws):
             if mtype == "ping":
                 try: ws.send(json.dumps({"type": "pong", "t": int(time.time())}))
                 except Exception: break
+                continue
+            # ---- public rooms: join / publish / leave (broadcast to all members) ----
+            if mtype == "room_join":
+                rid = msg.get("room"); r = rooms.get(rid)
+                if r is not None:
+                    r["sockets"].add(ws)
+                    try: ws.send(json.dumps({"type": "room_joined", "room": rid, "name": r["name"],
+                                             "members": len(r["sockets"]), "history": r["history"][-ROOM_HISTORY:]}))
+                    except Exception: pass
+                    _broadcast_room(rid, {"type": "room_presence", "room": rid, "members": len(r["sockets"])}, exclude=ws)
+                else:
+                    try: ws.send(json.dumps({"type": "error", "error": "no such room", "room": rid}))
+                    except Exception: pass
+                continue
+            if mtype == "room_leave":
+                r = rooms.get(msg.get("room"))
+                if r:
+                    r["sockets"].discard(ws)
+                    _broadcast_room(msg.get("room"), {"type": "room_presence", "room": msg.get("room"), "members": len(r["sockets"])})
+                continue
+            if mtype == "room_msg":
+                rid = msg.get("room"); r = rooms.get(rid)
+                if r is not None and ws in r["sockets"]:
+                    out = {"type": "room_msg", "room": rid, "from": my_id, "body": msg.get("body", ""), "t": int(time.time())}
+                    r["history"].append(out); r["history"][:] = r["history"][-ROOM_HISTORY:]
+                    _broadcast_room(rid, out)   # everyone in the room, including the sender's other devices
                 continue
             to = msg.get("to")
             if to and peers.get(to):
@@ -825,6 +905,7 @@ def ws(ws):
                                              "reason": "peer offline — will deliver when they reconnect"}))
                     except Exception: pass
     finally:
+        _leave_all_rooms(ws)
         lst = peers.get(my_id)
         if lst and ws in lst:
             lst.remove(ws)
