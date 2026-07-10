@@ -319,7 +319,41 @@ class UserDB:
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.execute("""CREATE TABLE IF NOT EXISTS users(
             username TEXT PRIMARY KEY, salt TEXT, pwd_hash TEXT, identity TEXT, created_at REAL)""")
+        # Persistent offline queue: survives server restarts so a disconnected device still gets
+        # its messages when it reconnects.
+        self.conn.execute("""CREATE TABLE IF NOT EXISTS pending_queue(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, recipient TEXT NOT NULL, ts REAL NOT NULL, msg TEXT NOT NULL)""")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_pq_recipient ON pending_queue(recipient)")
         self.conn.commit()
+
+    def q_enqueue(self, to, ts, msg_json, cap):
+        with self._lock:
+            self.conn.execute("INSERT INTO pending_queue(recipient,ts,msg) VALUES(?,?,?)", (to, ts, msg_json))
+            # keep only the newest `cap` per recipient
+            self.conn.execute(
+                "DELETE FROM pending_queue WHERE recipient=? AND id NOT IN "
+                "(SELECT id FROM pending_queue WHERE recipient=? ORDER BY id DESC LIMIT ?)",
+                (to, to, cap))
+            self.conn.commit()
+            return self.conn.execute("SELECT COUNT(*) FROM pending_queue WHERE recipient=?", (to,)).fetchone()[0]
+
+    def q_rows(self, to):
+        with self._lock:
+            return self.conn.execute(
+                "SELECT id,ts,msg FROM pending_queue WHERE recipient=? ORDER BY id ASC", (to,)).fetchall()
+
+    def q_delete(self, ids):
+        if not ids: return
+        with self._lock:
+            self.conn.executemany("DELETE FROM pending_queue WHERE id=?", [(i,) for i in ids]); self.conn.commit()
+
+    def q_prune(self, min_ts):
+        with self._lock:
+            self.conn.execute("DELETE FROM pending_queue WHERE ts < ?", (min_ts,)); self.conn.commit()
+
+    def q_clear_all(self):
+        with self._lock:
+            self.conn.execute("DELETE FROM pending_queue"); self.conn.commit()
     def get(self, username):
         with self._lock:
             r = self.conn.execute(
@@ -456,32 +490,23 @@ QUEUE_TTL = int(os.environ.get("QUEUE_TTL", str(7 * 24 * 3600)))  # seconds
 pending = collections.defaultdict(collections.deque)  # id -> deque[(ts, msg_dict)]
 
 def _enqueue(to, msg):
-    q = pending[to]
-    now = time.time()
-    # prune expired
-    while q and (now - q[0][0]) > QUEUE_TTL:
-        q.popleft()
-    q.append((now, msg))
-    while len(q) > QUEUE_MAX_PER_USER:
-        q.popleft()
-    return len(q)
+    """Store-and-forward: persist a message for an offline recipient (survives server restarts)."""
+    db.q_prune(time.time() - QUEUE_TTL)
+    return db.q_enqueue(to, time.time(), json.dumps(msg), QUEUE_MAX_PER_USER)
 
 def _flush(to, ws):
-    q = pending.get(to)
-    if not q:
-        return 0
+    """Deliver everything queued for `to` on reconnect, deleting each as it is sent."""
     now = time.time()
     sent = 0
-    while q:
-        ts, msg = q.popleft()
+    done = []
+    for (rid, ts, msg_json) in db.q_rows(to):
         if (now - ts) > QUEUE_TTL:
-            continue
+            done.append(rid); continue
         try:
-            ws.send(json.dumps(msg)); sent += 1
+            ws.send(msg_json); sent += 1; done.append(rid)
         except Exception:
-            q.appendleft((ts, msg)); break
-    if not q:
-        pending.pop(to, None)
+            break
+    db.q_delete(done)
     return sent
 
 def _ip(): return request.headers.get("X-Forwarded-For", request.remote_addr or "?").split(",")[0].strip()
@@ -732,7 +757,7 @@ def _kick_all_peers():
         for ws in (socks or []):
             try: ws.close()
             except Exception: pass
-    peers.clear(); peer_since.clear(); pending.clear()
+    peers.clear(); peer_since.clear(); db.q_clear_all()
 
 @app.post("/admin/reset-chain")
 def admin_reset_chain():
